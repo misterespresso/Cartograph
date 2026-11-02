@@ -705,6 +705,13 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::RedrawMapCoroutine(
 	};
 
 	CARTO_LOG_DEBUG("RedrawMapCoroutine Started. Entire: %d", bRedrawEntirely);
+
+	if (FPlatformProperties::IsServerOnly())
+	{
+		ServerApplyBuildingChanges(AddedBuildings, RemovedBuildings);
+		co_return;
+	}
+
 	const double StartTime = FPlatformTime::Seconds();
 
 	const float TimeBudget = FCartograph_ConfigStruct::GetActiveConfig(GetWorld()).RedrawTimeBudget;
@@ -999,6 +1006,9 @@ void UCartographGameInstanceModule::ResetBuildingData()
 	BuildingDataIndexRedirector.Empty();
 	CurrentBuildingQuadTree.Empty();
 	BuildingCountMap.Empty();
+	ServerUnsortedAdds.Empty();
+	ServerRemoved.Empty();
+	ServerRemovedCount = 0;
 }
 #pragma endregion
 
@@ -1483,7 +1493,8 @@ void UCartographGameInstanceModule::FillBuildLayerDataCache()
 
 void UCartographGameInstanceModule::OnBuildingDataAdd(const FBuildingData& AddedBuildingData, int32 Pos)
 {
-	if (AddedBuildingData.VisualBoxCache.bIsValid)
+	// The quad tree is only for drawing
+	if (AddedBuildingData.VisualBoxCache.bIsValid && !FPlatformProperties::IsServerOnly())
 	{
 		CurrentBuildingQuadTree.Insert(BuildingDataIndexRedirector.Num(), AddedBuildingData.VisualBoxCache);
 		// The initial data is added in sorted order, so there's nothing to shift
@@ -1525,6 +1536,113 @@ void UCartographGameInstanceModule::OnBuildingDataRemove(const FBuildingData& Re
 	}
 
 	BuildingCountMap.FindChecked(RemovedBuildingData.BuildableClassHash)--;
+}
+
+
+// Server changes cost a binary search (removal) or an append (add) instead of an O(n) shift.
+// Joining clients still get the sorted array: the snapshot compacts first.
+void UCartographGameInstanceModule::ServerApplyBuildingChanges(TArray<FBuildingData>& AddedBuildings, const TArray<FBuildingData>& RemovedBuildings)
+{
+	constexpr int32 MaxUncompactedChanges = 4096;
+
+	if (ServerRemoved.Num() != CurrentBuildingData.Num())
+	{
+		ServerRemoved.Init(false, CurrentBuildingData.Num());
+		ServerRemovedCount = 0;
+	}
+
+	for (FBuildingData& AddedBuildingData : AddedBuildings)
+	{
+		BuildingCountMap.FindOrAdd(AddedBuildingData.BuildableClassHash)++;
+		ServerUnsortedAdds.Add(MoveTemp(AddedBuildingData));
+	}
+
+	for (const FBuildingData& RemovedBuildingData : RemovedBuildings)
+	{
+		bool bFound = false;
+
+		// Recently added ones are few, a linear scan is fine
+		const int32 RecentIndex = ServerUnsortedAdds.IndexOfByKey(RemovedBuildingData);
+		if (RecentIndex != INDEX_NONE)
+		{
+			ServerUnsortedAdds.RemoveAtSwap(RecentIndex);
+			bFound = true;
+		}
+		else
+		{
+			const int32 Num = CurrentBuildingData.Num();
+			for (int32 i = Algo::LowerBound(CurrentBuildingData, RemovedBuildingData); i < Num; ++i)
+			{
+				if (!ServerRemoved[i] && RemovedBuildingData == CurrentBuildingData[i])
+				{
+					ServerRemoved[i] = true;
+					++ServerRemovedCount;
+					bFound = true;
+					break;
+				}
+				if (RemovedBuildingData < CurrentBuildingData[i])  // Sorted by Z, we're past it
+				{
+					break;
+				}
+			}
+		}
+
+		if (!bFound)
+		{
+			CARTO_LOG_ERROR("Can't find removed building data");
+			continue;
+		}
+		if (uint32* Count = BuildingCountMap.Find(RemovedBuildingData.BuildableClassHash); Count && *Count > 0)
+		{
+			--*Count;
+		}
+	}
+
+	if (ServerUnsortedAdds.Num() + ServerRemovedCount > MaxUncompactedChanges)
+	{
+		CompactServerBuildingData();
+	}
+}
+
+
+void UCartographGameInstanceModule::CompactServerBuildingData()
+{
+	if (ServerUnsortedAdds.IsEmpty() && ServerRemovedCount == 0)
+	{
+		return;
+	}
+
+	const double StartTime = FPlatformTime::Seconds();
+	Algo::Sort(ServerUnsortedAdds);
+
+	// Merge the kept sorted entries with the sorted adds, O(n)
+	TArray<FBuildingData> Merged;
+	Merged.Reserve(CurrentBuildingData.Num() - ServerRemovedCount + ServerUnsortedAdds.Num());
+	int32 AddIndex = 0;
+	const int32 Num = CurrentBuildingData.Num();
+	for (int32 i = 0; i < Num; ++i)
+	{
+		if (ServerRemoved.IsValidIndex(i) && ServerRemoved[i])
+		{
+			continue;
+		}
+		while (AddIndex < ServerUnsortedAdds.Num() && ServerUnsortedAdds[AddIndex] < CurrentBuildingData[i])
+		{
+			Merged.Add(MoveTemp(ServerUnsortedAdds[AddIndex++]));
+		}
+		Merged.Add(MoveTemp(CurrentBuildingData[i]));
+	}
+	while (AddIndex < ServerUnsortedAdds.Num())
+	{
+		Merged.Add(MoveTemp(ServerUnsortedAdds[AddIndex++]));
+	}
+
+	CurrentBuildingData = MoveTemp(Merged);
+	ServerUnsortedAdds.Reset();
+	ServerRemoved.Init(false, CurrentBuildingData.Num());
+	ServerRemovedCount = 0;
+
+	CARTO_LOG("Compacted server building data: %d buildings, %.1f ms", CurrentBuildingData.Num(), (FPlatformTime::Seconds() - StartTime) * 1000.0);
 }
 
 

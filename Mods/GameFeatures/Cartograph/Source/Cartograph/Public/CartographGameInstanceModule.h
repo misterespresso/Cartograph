@@ -230,6 +230,11 @@ private:
 	void OnBuildingDataAdd(const FBuildingData& AddedBuildingData, int32 Pos);
     void OnBuildingDataRemove(const FBuildingData& RemovedBuildingData, int32 Pos);
 
+	// Dedicated server only, it never draws: changes skip the sorted insert and the quad tree
+	void ServerApplyBuildingChanges(TArray<FBuildingData>& AddedBuildings, const TArray<FBuildingData>& RemovedBuildings);
+	// Folds ServerUnsortedAdds and ServerRemoved back into the sorted CurrentBuildingData
+	void CompactServerBuildingData();
+
 	void GatherBuildables();
 	void GatherModOverrides();
 
@@ -384,6 +389,12 @@ protected:
 	bool IsPendingRedrawEntire = false;
 	TArray<FBuildingData> PendingAddBuildingData;
 	TArray<FBuildingData> PendingRemoveBuildingData;
+
+	// Dedicated server only. Added buildings wait here and removed ones are only marked,
+	// so a change costs a binary search instead of shifting the whole sorted array.
+	TArray<FBuildingData> ServerUnsortedAdds;
+	TBitArray<> ServerRemoved;
+	int32 ServerRemovedCount = 0;
 
 	bool IsRedrawingEntirely = false;
 	FBox2D RedrawArea;

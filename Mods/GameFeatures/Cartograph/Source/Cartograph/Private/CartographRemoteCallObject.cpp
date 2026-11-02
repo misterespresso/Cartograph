@@ -10,9 +10,10 @@
 #include "Cartograph_ConfigStruct.h"
 
 
-// Ideally, the server would send all the data without getting the request after every slice.
-// But I couldn't figure out how to "gradually" send the slices.
-// I should poll for whether it's "safe"(not overflow the network buffer) to send the next slice, but seems like there's no easy way to do that.
+// The server sends a window of slices per request instead of one, so a big save takes
+// SlicesPerRequest times fewer round trips. 16 slices is ~32 KB in flight, far below the reliable buffer.
+// Both sides must run the same build: the client asks for the next window after the last slice of one.
+constexpr int32 SlicesPerRequest = 16;
 
 bool FBuildingDataBuffer::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
 {
@@ -38,6 +39,10 @@ void UCartographRemoteCallObject::ServerRequestInitialBuildingData_Implementatio
     case EInitialDataSendPhase::Initial:
     {
         CARTO_LOG_ERROR_RETURN_IF_NULL(UCartographGameInstanceModule::Instance);
+        if (FPlatformProperties::IsServerOnly())
+        {
+            UCartographGameInstanceModule::Instance->CompactServerBuildingData();
+        }
         InitialBuildingDataToSend.Reset();
         FMemoryWriter Archive{ InitialBuildingDataToSend };
 
@@ -61,18 +66,16 @@ void UCartographRemoteCallObject::ServerRequestInitialBuildingData_Implementatio
         return;
     }
 
-    if (LastSentSlice + 1 >= SliceCount)
+    for (int32 Sent = 0; Sent < SlicesPerRequest && LastSentSlice + 1 < SliceCount; ++Sent)
     {
-        return;
+        const int32 i = ++LastSentSlice;
+        FBuildingDataBuffer SendBuffer;
+        const int16 Size = FMath::Min(BuildingDataBufferMaxSize, InitialBuildingDataToSend.Num() - i * BuildingDataBufferMaxSize);
+        FMemory::Memcpy(SendBuffer.Data, InitialBuildingDataToSend.GetData() + i * BuildingDataBufferMaxSize, Size);
+        ClientReceiveInitialBuildingData(SendBuffer, Size, SliceCount);
+
+        CARTO_LOG_DEBUG("Sending Initial Data (%d/%d)", i + 1, SliceCount);
     }
-
-    const int32 i = ++LastSentSlice;
-    FBuildingDataBuffer SendBuffer;
-    const int16 Size = FMath::Min(BuildingDataBufferMaxSize, InitialBuildingDataToSend.Num() - i * BuildingDataBufferMaxSize);
-    FMemory::Memcpy(SendBuffer.Data, InitialBuildingDataToSend.GetData() + i * BuildingDataBufferMaxSize, Size);
-    ClientReceiveInitialBuildingData(SendBuffer, Size, SliceCount);
-
-    CARTO_LOG_DEBUG("Sending Initial Data (%d/%d)", i + 1, SliceCount);
 }
 
 
@@ -92,8 +95,12 @@ void UCartographRemoteCallObject::ClientReceiveInitialBuildingData_Implementatio
         InitialBuildableDeserialize();
     }
 
-    ServerRequestInitialBuildingData(GetWorld()->GetFirstPlayerController(), 
-        IsLast ? EInitialDataSendPhase::Finished : EInitialDataSendPhase::Normal);
+    // Only the last slice of a window asks for more
+    if (IsLast || ReceivedSliceCount % SlicesPerRequest == 0)
+    {
+        ServerRequestInitialBuildingData(GetWorld()->GetFirstPlayerController(),
+            IsLast ? EInitialDataSendPhase::Finished : EInitialDataSendPhase::Normal);
+    }
 }
 
 
