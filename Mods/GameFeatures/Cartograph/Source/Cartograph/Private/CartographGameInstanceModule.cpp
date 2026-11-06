@@ -408,7 +408,19 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 				ResetBuildingData();
 				RCO->ReceivedSliceCount = 0;
 				RCO->Buffer.Empty();
-				RCO->ServerRequestInitialBuildingData(PlayerController, EInitialDataSendPhase::Initial);
+
+				// Let the game finish streaming the world to this player first; the map can wait
+				constexpr float InitialSyncDelaySeconds = 10.0f;
+				FTimerHandle Handle;
+				GetWorld()->GetTimerManager().SetTimer(Handle,
+					[WeakRCO = TWeakObjectPtr<UCartographRemoteCallObject>(RCO), WeakController = TWeakObjectPtr<AFGPlayerController>(PlayerController)]()
+					{
+						if (WeakRCO.IsValid() && WeakController.IsValid())
+						{
+							WeakRCO->ServerRequestInitialBuildingData(WeakController.Get(), EInitialDataSendPhase::Initial);
+						}
+					},
+					InitialSyncDelaySeconds, false);
 			}
 			else
 			{

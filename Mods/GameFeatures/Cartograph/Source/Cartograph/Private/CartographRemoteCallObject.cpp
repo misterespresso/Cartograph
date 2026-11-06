@@ -1,7 +1,9 @@
 ﻿#include "CartographRemoteCallObject.h"
 
+#include "Engine/World.h"
 #include "Net/UnrealNetwork.h"
 #include "Serialization/MemoryReader.h"
+#include "TimerManager.h"
 #include "Serialization/MemoryWriter.h"
 
 #include "Module/GameInstanceModuleManager.h"
@@ -10,10 +12,13 @@
 #include "Cartograph_ConfigStruct.h"
 
 
-// The server sends a window of slices per request instead of one, so a big save takes
-// SlicesPerRequest times fewer round trips. 16 slices is ~32 KB in flight, far below the reliable buffer.
+// The server sends a window of slices per request instead of one, and the client waits a moment before
+// asking for the next window. The game streams the whole world to a joining player at the same time, and a
+// player's netspeed is ~120 KB/s: taking all of it made joins lag (missed acks, stalled movement). 8 slices
+// (~16 KB) every 0.2 s plus the round trip keeps the map at ~60-70 KB/s, about half.
 // Both sides must run the same build: the client asks for the next window after the last slice of one.
-constexpr int32 SlicesPerRequest = 16;
+constexpr int32 SlicesPerRequest = 8;
+constexpr float SecondsBetweenRequests = 0.2f;
 
 bool FBuildingDataBuffer::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
 {
@@ -95,11 +100,23 @@ void UCartographRemoteCallObject::ClientReceiveInitialBuildingData_Implementatio
         InitialBuildableDeserialize();
     }
 
-    // Only the last slice of a window asks for more
-    if (IsLast || ReceivedSliceCount % SlicesPerRequest == 0)
+    if (IsLast)
     {
-        ServerRequestInitialBuildingData(GetWorld()->GetFirstPlayerController(),
-            IsLast ? EInitialDataSendPhase::Finished : EInitialDataSendPhase::Normal);
+        ServerRequestInitialBuildingData(GetWorld()->GetFirstPlayerController(), EInitialDataSendPhase::Finished);
+    }
+    // Only the last slice of a window asks for more, after a pause so the game's own traffic gets through
+    else if (ReceivedSliceCount % SlicesPerRequest == 0)
+    {
+        FTimerHandle Handle;
+        GetWorld()->GetTimerManager().SetTimer(Handle,
+            [WeakThis = TWeakObjectPtr<UCartographRemoteCallObject>(this)]()
+            {
+                if (WeakThis.IsValid() && WeakThis->GetWorld())
+                {
+                    WeakThis->ServerRequestInitialBuildingData(WeakThis->GetWorld()->GetFirstPlayerController(), EInitialDataSendPhase::Normal);
+                }
+            },
+            SecondsBetweenRequests, false);
     }
 }
 
